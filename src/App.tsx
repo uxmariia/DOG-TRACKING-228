@@ -1,435 +1,413 @@
 import { useState, useEffect } from 'react';
-import { createClient } from './utils/supabase/client';
-import { apiClient } from './utils/api';
-import { Auth } from './components/Auth';
-import { Home } from './components/Home';
-import { DogProfiles } from './components/DogProfiles';
-import CreateTrail from './components/CreateTrail';
-import DogTracking from "./components/DogTracking";
-import { TrackHistory } from './components/TrackHistory';
-import { TrackAnalysis } from './components/TrackAnalysis';
-import { Statistics } from './components/Statistics';
-import { ShareTrack } from './components/ShareTrack';
-import { LiveTracking } from './components/LiveTracking';
+import { TrailPoint, ObjectMarker, Dog } from '../App';
+import { ArrowLeft, Play, Pause, CheckCircle, MapPin, Copy, Satellite, AlertCircle } from 'lucide-react';
+import { apiClient } from '../utils/api';
+import { copyToClipboard } from '../utils/clipboard';
+import { geoService, GeoPosition, GeoError } from '../utils/geolocation';
+import { ClientMapView } from './ClientMapView';
+import { GPSIndicator } from './GPSIndicator';
 
-export type Dog = {
-  id: string;
-  name: string;
-  breed: string;
-  birthDate: string;
-  specialization: string;
-  photo?: string;
-};
+interface DogTrackingProps {
+  dog: Dog | null;
+  trail: TrailPoint[];
+  placedObjects: ObjectMarker[];
+  onFinish: (dogPoints: TrailPoint[], foundObjects: ObjectMarker[]) => void;
+  onBack: () => void;
+  onStartLiveSession: (dogId: string) => Promise<string | null>;
+  liveSessionId: string | null;
+}
 
-export type TrailPoint = {
-  lat: number;
-  lng: number;
-  timestamp: number;
-};
+export function DogTracking({ dog, trail, placedObjects, onFinish, onBack, onStartLiveSession, liveSessionId }: DogTrackingProps) {
+  const [isTracking, setIsTracking] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
+  const [dogPoints, setDogPoints] = useState<TrailPoint[]>([]);
+  const [foundObjects, setFoundObjects] = useState<ObjectMarker[]>([]);
+  const [showObjectPrompt, setShowObjectPrompt] = useState(false);
+  const [localLiveSessionId, setLocalLiveSessionId] = useState<string | null>(null);
+  const [copiedSessionCode, setCopiedSessionCode] = useState(false);
+  const [gpsStatus, setGpsStatus] = useState<'waiting' | 'active' | 'error'>('waiting');
+  const [gpsError, setGpsError] = useState<string>('');
+  const [currentAccuracy, setCurrentAccuracy] = useState<number>(0);
+  const [lastPosition, setLastPosition] = useState<any>(null);
+  const [showGpsPermissionDialog, setShowGpsPermissionDialog] = useState(false);
+  const [requestingPermission, setRequestingPermission] = useState(false);
+  
+  // Local state for trail/objects to support resume functionality
+  const [activeTrail, setActiveTrail] = useState<TrailPoint[]>(trail);
+  const [activePlacedObjects, setActivePlacedObjects] = useState<ObjectMarker[]>(placedObjects);
 
-export type ObjectMarker = {
-  id: string;
-  lat: number;
-  lng: number;
-  type: 'placed' | 'found';
-  timestamp: number;
-};
-
-export type Track = {
-  id: string;
-  dogId: string;
-  date: string;
-  trailPoints: TrailPoint[];
-  dogPoints: TrailPoint[];
-  objects: ObjectMarker[];
-  conditions: {
-    weather: string;
-    temperature: string;
-    wind: string;
-    surface: string;
-    notes: string;
-  };
-  stats: {
-    trailDistance: number;
-    dogDistance: number;
-    duration: number;
-    averageSpeed: number;
-    averageDeviation: number;
-    maxDeviation: number;
-    objectsFound: number;
-    objectsTotal: number;
-  };
-};
-
-export default function App() {
-  const [currentScreen, setCurrentScreen] = useState<'home' | 'dogs' | 'create-trail' | 'track-dog' | 'history' | 'analysis' | 'stats' | 'share' | 'live'>('home');
-  const [dogs, setDogs] = useState<Dog[]>([]);
-  const [tracks, setTracks] = useState<Track[]>([]);
-  const [selectedDog, setSelectedDog] = useState<Dog | null>(null);
-  const [currentTrail, setCurrentTrail] = useState<TrailPoint[] | null>(null);
-  const [currentObjects, setCurrentObjects] = useState<ObjectMarker[]>([]);
-  const [currentConditions, setCurrentConditions] = useState<any>(null);
-  const [selectedTrack, setSelectedTrack] = useState<Track | null>(null);
-  const [user, setUser] = useState<any>(null);
-  const [loading, setLoading] = useState(true);
-  const [liveSessionId, setLiveSessionId] = useState<string | null>(null);
-
-  const supabase = createClient();
-
-  // Check for existing session
+  // Resume functionality
   useEffect(() => {
-    checkSession();
+    const saved = localStorage.getItem('current_tracking_session');
+    if (saved && !isTracking && dogPoints.length === 0) {
+      try {
+        const data = JSON.parse(saved);
+        // Valid for 24 hours
+        if (Date.now() - data.timestamp < 24 * 60 * 60 * 1000) {
+          if (confirm('Знайдено незавершене тренування. Відновити?')) {
+            setDogPoints(data.dogPoints || []);
+            setFoundObjects(data.foundObjects || []);
+            if (data.trail && data.trail.length > 0) setActiveTrail(data.trail);
+            if (data.placedObjects) setActivePlacedObjects(data.placedObjects);
+          } else {
+            localStorage.removeItem('current_tracking_session');
+          }
+        }
+      } catch (e) {
+        console.error('Error parsing saved tracking session', e);
+      }
+    }
   }, []);
 
-  const checkSession = async () => {
-    try {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (session?.user) {
-        setUser(session.user);
-        apiClient.setToken(session.access_token);
-        await loadUserData();
-      }
-    } catch (error) {
-      console.error('Error checking session:', error);
-    } finally {
-      setLoading(false);
+  // Auto-save
+  useEffect(() => {
+    if (isTracking && dogPoints.length > 0) {
+      localStorage.setItem('current_tracking_session', JSON.stringify({
+        dogPoints,
+        foundObjects,
+        trail: activeTrail,
+        placedObjects: activePlacedObjects,
+        timestamp: Date.now()
+      }));
     }
-  };
+  }, [dogPoints, foundObjects, isTracking, activeTrail, activePlacedObjects]);
 
-  const loadUserData = async () => {
-    try {
-      // Load dogs from server
-      const { dogs: serverDogs } = await apiClient.getDogs();
-      setDogs(serverDogs || []);
-
-      // Load tracks from server
-      const { tracks: serverTracks } = await apiClient.getTracks();
-      setTracks(serverTracks || []);
-    } catch (error) {
-      console.error('Error loading user data:', error);
+  // GPS tracking with real geolocation
+  useEffect(() => {
+    if (!isTracking || isPaused) {
+      geoService.stopWatching();
+      return;
     }
-  };
 
-  const handleLogin = async (email: string, password: string) => {
-    try {
-      const { data, error } = await supabase.auth.signInWithPassword({
-        email,
-        password,
-      });
+    setGpsStatus('waiting');
+    setGpsError('');
 
-      if (error) throw error;
+    // Start watching position
+    geoService.startWatching(
+      (position: GeoPosition) => {
+        setGpsStatus('active');
+        setCurrentAccuracy(position.accuracy || 0);
+        setLastPosition(position);
 
-      setUser(data.user);
-      apiClient.setToken(data.session.access_token);
-      await loadUserData();
-    } catch (error: any) {
-      console.error('Login error:', error);
-      throw new Error(error.message || 'Failed to login');
-    }
-  };
+        const newPoint: TrailPoint = {
+          lat: position.lat,
+          lng: position.lng,
+          timestamp: position.timestamp,
+        };
 
-  const handleSignup = async (email: string, password: string, name: string) => {
-    try {
-      const { user: newUser } = await apiClient.signup(email, password, name);
-      
-      // Now login
-      await handleLogin(email, password);
-    } catch (error: any) {
-      console.error('Signup error:', error);
-      throw new Error(error.message || 'Failed to signup');
-    }
-  };
+        setDogPoints(prev => {
+          const updated = [...prev, newPoint];
+          
+          // Update live session if active
+          if (liveSessionId || localLiveSessionId) {
+            updateLiveSession(updated, foundObjects);
+          }
+          
+          return updated;
+        });
 
- const handleResetPassword = async (email: string) => {
-    try {
-      const { error } = await supabase.auth.resetPasswordForEmail(email, {
-        redirectTo: window.location.origin,
-      });
-      if (error) throw error;
-    } catch (error: any) {
-      console.error('Reset password error:', error);
-      throw new Error(error.message || 'Failed to reset password');
-    }
-  };
-
-  const handleLogout = async () => {
-    try {
-      await supabase.auth.signOut();
-      setUser(null);
-      setDogs([]);
-      setTracks([]);
-      apiClient.setToken(null);
-    } catch (error) {
-      console.error('Logout error:', error);
-    }
-  };
-
-  const addDog = async (dog: Dog) => {
-    try {
-      const { dog: newDog } = await apiClient.createDog(dog);
-      setDogs([...dogs, newDog]);
-    } catch (error) {
-      console.error('Error adding dog:', error);
-      alert('Помилка додавання собаки');
-    }
-  };
-
-const updateDog = async (dog: Dog) => {
-    try {
-      await apiClient.updateDog(dog);
-      setDogs(dogs.map(d => d.id === dog.id ? dog : d));
-    } catch (error) {
-      console.error('Error updating dog:', error);
-      alert('Помилка оновлення профілю');
-    }
-  };
-
-  const deleteDog = async (id: string) => {
-    try {
-      await apiClient.deleteDog(id);
-      setDogs(dogs.filter(d => d.id !== id));
-    } catch (error) {
-      console.error('Error deleting dog:', error);
-      alert('Помилка видалення собаки');
-    }
-  };
-
-  const addTrack = async (track: Track) => {
-    try {
-      const { track: newTrack } = await apiClient.createTrack(track);
-      setTracks([...tracks, newTrack]);
-    } catch (error) {
-      console.error('Error adding track:', error);
-      alert('Помилка збереження тренування');
-    }
-  };
-
-  const navigateTo = (screen: typeof currentScreen, dog?: Dog, track?: Track) => {
-    setCurrentScreen(screen);
-    if (dog) setSelectedDog(dog);
-    if (track) setSelectedTrack(track);
-  };
-
-  const startTrail = (dog: Dog) => {
-    setSelectedDog(dog);
-    setCurrentTrail(null);
-    setCurrentObjects([]);
-    setCurrentConditions(null);
-    setCurrentScreen('create-trail');
-  };
-
-  const finishTrail = (trail: TrailPoint[], objects: ObjectMarker[], conditions: any) => {
-    setCurrentTrail(trail);
-    setCurrentObjects(objects);
-    setCurrentConditions(conditions);
-    setCurrentScreen('track-dog');
-  };
-
-  const finishTracking = async (dogPoints: TrailPoint[], foundObjects: ObjectMarker[]) => {
-    if (!selectedDog || !currentTrail) return;
-
-    // Calculate statistics
-    const trailDistance = calculateDistance(currentTrail);
-    const dogDistance = calculateDistance(dogPoints);
-    const duration = dogPoints.length > 0 ? (dogPoints[dogPoints.length - 1].timestamp - dogPoints[0].timestamp) / 1000 : 0;
-    const averageSpeed = duration > 0 ? dogDistance / duration : 0;
-    const deviations = calculateDeviations(currentTrail, dogPoints);
-    
-    const newTrack: Track = {
-      id: Date.now().toString(),
-      dogId: selectedDog.id,
-      date: new Date().toISOString(),
-      trailPoints: currentTrail,
-      dogPoints: dogPoints,
-      objects: [...currentObjects, ...foundObjects],
-      conditions: currentConditions,
-      stats: {
-        trailDistance,
-        dogDistance,
-        duration,
-        averageSpeed,
-        averageDeviation: deviations.average,
-        maxDeviation: deviations.max,
-        objectsFound: foundObjects.filter(o => o.type === 'found').length,
-        objectsTotal: currentObjects.filter(o => o.type === 'placed').length,
+        // Auto-detect nearby objects
+        activePlacedObjects.forEach(obj => {
+          const isAlreadyFound = foundObjects.some(f => f.id === obj.id);
+          if (!isAlreadyFound) {
+            const distance = Math.sqrt(
+              Math.pow((obj.lat - position.lat) * 111000, 2) +
+              Math.pow((obj.lng - position.lng) * 111000, 2)
+            );
+            if (distance < 5) {
+              setShowObjectPrompt(true);
+            }
+          }
+        });
       },
-    };
-
-    await addTrack(newTrack);
-    setSelectedTrack(newTrack);
-    setCurrentTrail(null);
-    setCurrentObjects([]);
-    setCurrentConditions(null);
-    
-    // End live session if active
-    if (liveSessionId) {
-      try {
-        await apiClient.endLiveSession(liveSessionId);
-        setLiveSessionId(null);
-      } catch (error) {
-        console.error('Error ending live session:', error);
+      (error: GeoError) => {
+        setGpsStatus('error');
+        setGpsError(error.message);
+        console.error('GPS error:', error);
       }
-    }
-    
-    setCurrentScreen('analysis');
-  };
-
-  const calculateDistance = (points: TrailPoint[]): number => {
-    let distance = 0;
-    for (let i = 1; i < points.length; i++) {
-      distance += getDistanceBetweenPoints(points[i - 1], points[i]);
-    }
-    return distance;
-  };
-
-  const getDistanceBetweenPoints = (p1: TrailPoint, p2: TrailPoint): number => {
-    const R = 6371000; // Earth radius in meters
-    const dLat = (p2.lat - p1.lat) * Math.PI / 180;
-    const dLng = (p2.lng - p1.lng) * Math.PI / 180;
-    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-              Math.cos(p1.lat * Math.PI / 180) * Math.cos(p2.lat * Math.PI / 180) *
-              Math.sin(dLng / 2) * Math.sin(dLng / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return R * c;
-  };
-
-  const calculateDeviations = (trail: TrailPoint[], dog: TrailPoint[]): { average: number; max: number } => {
-    if (trail.length === 0 || dog.length === 0) return { average: 0, max: 0 };
-
-    let totalDeviation = 0;
-    let maxDeviation = 0;
-
-    dog.forEach(dogPoint => {
-      let minDistance = Infinity;
-      trail.forEach(trailPoint => {
-        const distance = getDistanceBetweenPoints(dogPoint, trailPoint);
-        if (distance < minDistance) {
-          minDistance = distance;
-        }
-      });
-      totalDeviation += minDistance;
-      if (minDistance > maxDeviation) {
-        maxDeviation = minDistance;
-      }
-    });
-
-    return {
-      average: totalDeviation / dog.length,
-      max: maxDeviation,
-    };
-  };
-
-  if (loading) {
-    return (
-      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
-        <div className="text-center">
-          <div className="text-6xl mb-4">🐕</div>
-          <p className="text-gray-600">Завантаження...</p>
-        </div>
-      </div>
     );
-  }
 
-  if (!user) {
-    return <Auth onLogin={handleLogin} onSignup={handleSignup} />;
-  }
+    return () => {
+      geoService.stopWatching();
+    };
+  }, [isTracking, isPaused, activePlacedObjects, foundObjects, liveSessionId, localLiveSessionId]);
+
+  const updateLiveSession = async (points: TrailPoint[], objs: ObjectMarker[]) => {
+    const sessionId = liveSessionId || localLiveSessionId;
+    if (!sessionId) return;
+
+    try {
+      await apiClient.updateLiveSession(sessionId, {
+        points,
+        objects: objs,
+        active: true,
+      });
+    } catch (error) {
+      console.error('Error updating live session:', error);
+    }
+  };
+
+  const handleStart = async () => {
+    setIsTracking(true);
+    setIsPaused(false);
+    
+    // Start live session
+    if (dog && onStartLiveSession && !liveSessionId && !localLiveSessionId) {
+      const sessionId = await onStartLiveSession(dog.id);
+      if (sessionId) {
+        setLocalLiveSessionId(sessionId);
+      }
+    }
+  };
+
+  const handlePause = () => {
+    setIsPaused(!isPaused);
+  };
+
+  const handleObjectFound = () => {
+    if (dogPoints.length === 0) return;
+
+    // Use last GPS position or last recorded point
+    const lastPoint = lastPosition 
+      ? { lat: lastPosition.lat, lng: lastPosition.lng }
+      : dogPoints[dogPoints.length - 1];
+
+    const newFoundObject: ObjectMarker = {
+      id: Date.now().toString(),
+      lat: lastPoint.lat,
+      lng: lastPoint.lng,
+      type: 'found',
+      timestamp: Date.now(),
+    };
+    setFoundObjects(prev => {
+      const updated = [...prev, newFoundObject];
+      
+      // Update live session
+      if (liveSessionId || localLiveSessionId) {
+        updateLiveSession(dogPoints, updated);
+      }
+      
+      return updated;
+    });
+    setShowObjectPrompt(false);
+  };
+
+  const handleFinish = () => {
+    if (dogPoints.length === 0) {
+      alert('Спочатку запишіть роботу собаки');
+      return;
+    }
+    localStorage.removeItem('current_tracking_session');
+    setIsTracking(false);
+    onFinish(dogPoints, foundObjects);
+  };
+
+  const handleCopySessionCode = () => {
+    const sessionId = liveSessionId || localLiveSessionId;
+    if (sessionId) {
+      copyToClipboard(sessionId);
+      setCopiedSessionCode(true);
+      setTimeout(() => setCopiedSessionCode(false), 2000);
+    }
+  };
+
+  const distance = dogPoints.length > 1 ? 
+    dogPoints.reduce((sum, point, i) => {
+      if (i === 0) return 0;
+      const prev = dogPoints[i - 1];
+      const R = 6371000;
+      const dLat = (point.lat - prev.lat) * Math.PI / 180;
+      const dLng = (point.lng - prev.lng) * Math.PI / 180;
+      const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.cos(prev.lat * Math.PI / 180) * Math.cos(point.lat * Math.PI / 180) *
+                Math.sin(dLng / 2) * Math.sin(dLng / 2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      return sum + R * c;
+    }, 0) : 0;
+
+  const duration = dogPoints.length > 0 ? 
+    Math.floor((Date.now() - dogPoints[0].timestamp) / 1000) : 0;
 
   return (
     <div className="min-h-screen bg-gray-50">
-      {currentScreen === 'home' && (
-        <Home 
-          dogs={dogs}
-          tracks={tracks}
-          user={user}
-          onNavigate={navigateTo}
-          onStartTrail={startTrail}
-          onLogout={handleLogout}
-        />
+      {/* Header */}
+      <div className="bg-green-600 text-white p-4 shadow-md sticky top-0 z-10">
+        <div className="flex items-center gap-3 mb-2">
+          <button onClick={onBack} className="p-2 hover:bg-green-700 rounded-lg transition-colors">
+            <ArrowLeft size={24} />
+          </button>
+          <h1>Робота собаки</h1>
+        </div>
+        {dog && (
+          <div className="text-sm text-green-100 text-center">Собака: {dog.name}</div>
+        )}
+      </div>
+
+      {/* Map Area */}
+      <div className="relative h-96 m-4 rounded-xl shadow-lg overflow-hidden">
+        {(activeTrail.length > 0 || dogPoints.length > 0) ? (
+          <ClientMapView
+            trailPoints={activeTrail}
+            dogPoints={dogPoints}
+            placedObjects={activePlacedObjects}
+            foundObjects={foundObjects}
+            isLive={isTracking}
+            currentPosition={lastPosition}
+            showAccuracy={gpsStatus === 'active'}
+            accuracy={currentAccuracy}
+            className="h-full"
+          />
+        ) : (
+          <div className="h-full bg-gradient-to-br from-green-50 to-blue-50 flex items-center justify-center">
+            <div className="text-center text-gray-500">
+              <MapPin size={48} className="mx-auto mb-2 opacity-50" />
+              <p className="text-sm">Почніть роботу для відображення карти</p>
+            </div>
+          </div>
+        )}
+        
+        {/* Live Session Indicator */}
+        {(liveSessionId || localLiveSessionId) && (
+          <div className="absolute top-2 left-2 right-2 z-[1000]">
+            <div className="bg-green-500 text-white px-3 py-2 rounded-lg text-xs flex items-center justify-between shadow-lg">
+              <div className="flex items-center gap-2">
+                <div className="w-2 h-2 bg-white rounded-full animate-pulse"></div>
+                <span>Live-трекінг активний</span>
+              </div>
+              <button
+                onClick={handleCopySessionCode}
+                className="flex items-center gap-1 bg-white/20 px-2 py-1 rounded hover:bg-white/30 transition-colors"
+              >
+                {copiedSessionCode ? <CheckCircle size={12} /> : <Copy size={12} />}
+                <span>{copiedSessionCode ? 'Скопійовано!' : liveSessionId || localLiveSessionId}</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Status overlay */}
+        {isTracking && (
+          <div className="absolute bottom-4 left-4 right-4 z-[1000]">
+            <div className="bg-white/90 backdrop-blur rounded-lg p-3 shadow-lg">
+              <div className="flex justify-between text-sm mb-1">
+                <span className="text-gray-600">Відстань:</span>
+                <span className="text-gray-800">{Math.round(distance)} м</span>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span className="text-gray-600">Час:</span>
+                <span className="text-gray-800">{Math.floor(duration / 60)}:{(duration % 60).toString().padStart(2, '0')}</span>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Stats */}
+      <div className="px-4 mb-6">
+        <div className="bg-white rounded-xl shadow-md p-4 grid grid-cols-3 gap-4">
+          <div className="text-center">
+            <div className="text-green-600 mb-1">{Math.round(distance)}</div>
+            <div className="text-xs text-gray-600">метрів</div>
+            <div className="text-[10px] text-gray-400 mt-1">~{Math.round(distance / 0.75)} кроків</div>
+          </div>
+          <div className="text-center border-x border-gray-200">
+            <div className="text-blue-600 mb-1">{dogPoints.length}</div>
+            <div className="text-xs text-gray-600">точок</div>
+          </div>
+          <div className="text-center">
+            <div className="text-orange-600 mb-1">{foundObjects.length}/{activePlacedObjects.length}</div>
+            <div className="text-xs text-gray-600">знайдено</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Object Detection Prompt */}
+      {showObjectPrompt && (
+        <div className="px-4 mb-6">
+          <div className="bg-orange-50 border-2 border-orange-300 rounded-xl p-4 shadow-lg">
+            <div className="flex items-start gap-3">
+              <MapPin className="text-orange-600 flex-shrink-0" size={24} />
+              <div className="flex-1">
+                <h3 className="text-orange-900 mb-2">Предмет поблизу!</h3>
+                <p className="text-sm text-orange-800 mb-3">Собака знайшла предмет?</p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={handleObjectFound}
+                    className="flex-1 bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 transition-colors"
+                  >
+                    Так, знайдено
+                  </button>
+                  <button
+                    onClick={() => setShowObjectPrompt(false)}
+                    className="flex-1 bg-gray-300 text-gray-700 px-4 py-2 rounded-lg hover:bg-gray-400 transition-colors"
+                  >
+                    Ні
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
-      {currentScreen === 'dogs' && (
-        <DogProfiles 
-          dogs={dogs}
-          onAddDog={addDog}
-          onDeleteDog={deleteDog}
-          onBack={() => navigateTo('home')}
-        />
-      )}
-      {currentScreen === 'create-trail' && (
-        <CreateTrail 
-          dog={selectedDog}
-          onFinish={finishTrail}
-          onBack={() => navigateTo('home')}
-          onStartLiveSession={async (dogId) => {
-            try {
-              const { session } = await apiClient.createLiveSession(dogId, 'trail');
-              setLiveSessionId(session.id);
-              return session.id;
-            } catch (error) {
-              console.error('Error starting live session:', error);
-              return null;
-            }
-          }}
-          liveSessionId={liveSessionId}
-        />
-      )}
-      {currentScreen === 'track-dog' && (
-        <DogTracking 
-          dog={selectedDog}
-          trail={currentTrail || []}
-          placedObjects={currentObjects}
-          onFinish={finishTracking}
-          onBack={() => navigateTo('home')}
-          onStartLiveSession={async (dogId) => {
-            try {
-              const { session } = await apiClient.createLiveSession(dogId, 'tracking');
-              setLiveSessionId(session.id);
-              return session.id;
-            } catch (error) {
-              console.error('Error starting live session:', error);
-              return null;
-            }
-          }}
-          liveSessionId={liveSessionId}
-        />
-      )}
-      {currentScreen === 'history' && (
-        <TrackHistory 
-          tracks={tracks}
-          dogs={dogs}
-          onSelectTrack={(track) => {
-            setSelectedTrack(track);
-            navigateTo('analysis');
-          }}
-          onBack={() => navigateTo('home')}
-        />
-      )}
-      {currentScreen === 'analysis' && selectedTrack && (
-        <TrackAnalysis 
-          track={selectedTrack}
-          dog={dogs.find(d => d.id === selectedTrack.dogId)}
-          onBack={() => navigateTo('history')}
-          onShare={() => {
-            navigateTo('share');
-          }}
-        />
-      )}
-      {currentScreen === 'stats' && (
-        <Statistics 
-          tracks={tracks}
-          dogs={dogs}
-          onBack={() => navigateTo('home')}
-        />
-      )}
-      {currentScreen === 'share' && (
-        <ShareTrack 
-          track={selectedTrack}
-          onBack={() => navigateTo('analysis')}
-        />
-      )}
-      {currentScreen === 'live' && (
-        <LiveTracking 
-          onBack={() => navigateTo('home')}
-        />
+
+      {/* Controls */}
+      <div className="px-4 pb-6 space-y-3">
+        {!isTracking ? (
+          <button
+            onClick={handleStart}
+            className="w-full bg-green-600 text-white p-5 rounded-xl shadow-md hover:bg-green-700 transition-colors flex items-center justify-center gap-3"
+          >
+            <Play size={24} />
+            <span>Почати роботу собаки</span>
+          </button>
+        ) : (
+          <>
+            <div className="grid grid-cols-2 gap-3">
+              <button
+                onClick={handlePause}
+                className={`p-5 rounded-xl shadow-md transition-colors flex items-center justify-center gap-2 ${
+                  isPaused 
+                    ? 'bg-green-600 text-white hover:bg-green-700' 
+                    : 'bg-yellow-600 text-white hover:bg-yellow-700'
+                }`}
+              >
+                {isPaused ? <Play size={20} /> : <Pause size={20} />}
+                <span>{isPaused ? 'Продовжити' : 'Пауза'}</span>
+              </button>
+
+              <button
+                onClick={handleObjectFound}
+                className="bg-orange-600 text-white p-5 rounded-xl shadow-md hover:bg-orange-700 transition-colors flex items-center justify-center gap-2"
+              >
+                <CheckCircle size={20} />
+                <span>Предмет знайдено</span>
+              </button>
+            </div>
+
+            <button
+              onClick={handleFinish}
+              className="w-full bg-blue-600 text-white p-5 rounded-xl shadow-md hover:bg-blue-700 transition-colors flex items-center justify-center gap-3"
+            >
+              <CheckCircle size={24} />
+              <span>Завершити роботу</span>
+            </button>
+          </>
+        )}
+      </div>
+
+      {/* Instructions */}
+      {!isTracking && (
+        <div className="px-4 pb-6">
+          <div className="bg-green-50 border border-green-200 rounded-xl p-4">
+            <h3 className="text-green-900 mb-2">Інструкції:</h3>
+            <ol className="text-sm text-green-800 space-y-1 list-decimal list-inside">
+              <li>Натисніть "Почати роботу собаки"</li>
+              <li>Пустіть собаку працювати по сліду</li>
+              <li>Підтверджуйте знайдені предмети</li>
+              <li>Завершіть роботу для перегляду результатів</li>
+            </ol>
+          </div>
+        </div>
       )}
     </div>
   );
